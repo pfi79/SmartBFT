@@ -2264,3 +2264,142 @@ func TestDontCommitInFlight(t *testing.T) {
 
 	app.AssertNotCalled(t, "Deliver")
 }
+
+// The new leader is the node that collected the view data messages of the others,
+// so a newView message that does not carry the new leader's own signed view data
+// message must not be accepted, regardless of where in the list the entries sit.
+func TestNewViewWithoutLeaderViewData(t *testing.T) {
+	for _, test := range []struct {
+		description string
+		signers     []uint64
+		accepted    bool
+		// expectedRejection is the reason the node must reject the message with.
+		// Empty when the message is expected to be accepted.
+		expectedRejection string
+	}{
+		{
+			description: "leader is first",
+			signers:     []uint64{1, 0, 2},
+			accepted:    true,
+		},
+		{
+			description: "leader is last",
+			signers:     []uint64{0, 2, 1},
+			accepted:    true,
+		},
+		{
+			description: "leader is in the middle",
+			signers:     []uint64{0, 1, 2},
+			accepted:    true,
+		},
+		{
+			description:       "leader is missing",
+			signers:           []uint64{0, 2, 3},
+			accepted:          false,
+			expectedRejection: "but it does not contain a signed view data message of the new leader",
+		},
+		{
+			// A quorum of distinct signers is still required, so repeating two
+			// non-leader signers is rejected before the leader is even looked at.
+			description:       "leader is missing and the signers are repeated",
+			signers:           []uint64{0, 2, 0, 2, 0},
+			accepted:          false,
+			expectedRejection: "valid view data messages while the quorum is",
+		},
+	} {
+		t.Run(test.description, func(t *testing.T) {
+			basicLog, err := zap.NewDevelopment()
+			assert.NoError(t, err)
+
+			rejected := make(chan struct{}, 1)
+			log := basicLog.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+				if strings.Contains(entry.Message, test.expectedRejection) {
+					select {
+					case rejected <- struct{}{}:
+					default:
+					}
+				}
+				return nil
+			})).Sugar()
+
+			verifier := &mocks.VerifierMock{}
+			verifier.On("VerifySignature", mock.Anything).Return(nil)
+			verifier.On("VerifyConsenterSig", mock.Anything, mock.Anything).Return(nil, nil)
+			verifier.On("RequestsFromProposal", mock.Anything).Return(nil)
+			controller := &mocks.ViewController{}
+			viewNumChan := make(chan uint64, 1)
+			seqNumChan := make(chan uint64, 1)
+			controller.On("ViewChanged", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+				viewNumChan <- args.Get(0).(uint64)
+				seqNumChan <- args.Get(1).(uint64)
+			})
+			reqTimer := &mocks.RequestsTimer{}
+			reqTimer.On("StopTimers")
+			reqTimer.On("RestartTimers")
+			app := &mocks.ApplicationMock{}
+			app.On("Deliver", mock.Anything, mock.Anything)
+			pruner := &mocks.Pruner{}
+			pruner.On("MaybePruneRevokedRequests")
+			state := &mocks.State{}
+			state.On("Save", mock.Anything).Return(nil)
+
+			checkpoint := types.Checkpoint{}
+			checkpoint.Set(lastDecision, lastDecisionSignatures)
+
+			vc := &bft.ViewChanger{
+				SelfID:        3,
+				N:             4,
+				NodesList:     []uint64{0, 1, 2, 3},
+				Logger:        log,
+				Verifier:      verifier,
+				Controller:    controller,
+				Ticker:        make(chan time.Time),
+				RequestsTimer: reqTimer,
+				Application:   app,
+				Pruner:        pruner,
+				State:         state,
+				Checkpoint:    &checkpoint,
+				InFlight:      &bft.InFlightData{},
+			}
+
+			// view 1 leader is node 1, so it is the sender and it must also be a signer
+			signed := make([]*protos.SignedViewData, 0)
+			for _, signer := range test.signers {
+				signed = append(signed, &protos.SignedViewData{
+					RawViewData: vdBytes,
+					Signer:      signer,
+					Signature:   nil,
+				})
+			}
+
+			msg := &protos.Message{
+				Content: &protos.Message_NewView{
+					NewView: &protos.NewView{
+						SignedViewData: signed,
+					},
+				},
+			}
+
+			vc.Start(1)
+			vc.HandleMessage(1, msg)
+
+			if test.accepted {
+				assert.Equal(t, uint64(1), <-viewNumChan)
+				assert.Equal(t, uint64(2), <-seqNumChan)
+			} else {
+				select {
+				case <-rejected:
+				case <-time.After(5 * time.Second):
+					assert.Fail(t, "the new view message was not rejected", "expected log: %q", test.expectedRejection)
+				}
+				select {
+				case <-viewNumChan:
+					assert.Fail(t, "the view was changed even though the new view message was rejected")
+				default:
+				}
+			}
+
+			vc.Stop()
+		})
+	}
+}

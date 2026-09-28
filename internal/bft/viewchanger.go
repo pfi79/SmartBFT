@@ -1090,6 +1090,15 @@ func (v *ViewChanger) validateNewViewMsg(msg *protos.NewView) (valid bool, sync 
 		return false, false, false
 	}
 
+	// The new leader is the node that collected the view data messages of the others,
+	// so its own attestation must be part of the new view message. Without it the other
+	// signers would be speaking on behalf of a view they never verified with the leader.
+	leader := v.getLeader()
+	if _, exists := nodesMap[leader]; !exists {
+		v.Logger.Warnf("Node %d is processing newView message, but it does not contain a signed view data message of the new leader %d", v.SelfID, leader)
+		return false, false, false
+	}
+
 	v.Logger.Debugf("Node %d found a quorum of valid view data messages within the new view message", v.SelfID)
 	return true, false, false
 }
